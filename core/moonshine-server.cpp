@@ -1,8 +1,7 @@
 /*
  * Moonshine Voice STT Server — AssemblyAI-compatible WebSocket API
  *
- * A standalone, zero-dependency C++ WebSocket server that speaks the
- * AssemblyAI Streaming v3 protocol using Moonshine Voice for local inference.
+ * Uses IXWebSocket library for proper, standards-compliant WebSocket handling.
  *
  * Build:
  *   cmake --build core/build --target moonshine-server
@@ -23,151 +22,28 @@
  *     • {"type":"Termination","audio_duration_seconds":...,"session_duration_seconds":...}
  */
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
-#include <thread>
+#include <unordered_map>
 #include <vector>
+
+#include <ixwebsocket/IXNetSystem.h>
+#include <ixwebsocket/IXWebSocket.h>
+#include <ixwebsocket/IXWebSocketServer.h>
 
 #include "moonshine-cpp.h"
 
-// ─── Minimal SHA-1 (for WebSocket handshake) ───────────────────────────
-
 namespace {
-
-struct SHA1 {
-  uint32_t h[5];
-  uint64_t totalBits;
-  uint8_t buf[64];
-  size_t bufLen;
-
-  SHA1() { reset(); }
-
-  void reset() {
-    h[0] = 0x67452301;
-    h[1] = 0xEFCDAB89;
-    h[2] = 0x98BADCFE;
-    h[3] = 0x10325476;
-    h[4] = 0xC3D2E1F0;
-    totalBits = 0;
-    bufLen = 0;
-  }
-
-  static uint32_t rol(uint32_t v, int n) {
-    return (v << n) | (v >> (32 - n));
-  }
-
-  void processBlock(const uint8_t block[64]) {
-    uint32_t w[80];
-    for (int i = 0; i < 16; i++) {
-      w[i] = (uint32_t(block[i * 4]) << 24) |
-             (uint32_t(block[i * 4 + 1]) << 16) |
-             (uint32_t(block[i * 4 + 2]) << 8) | uint32_t(block[i * 4 + 3]);
-    }
-    for (int i = 16; i < 80; i++) {
-      w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-    }
-    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
-    for (int i = 0; i < 80; i++) {
-      uint32_t f, k;
-      if (i < 20) {
-        f = (b & c) | ((~b) & d);
-        k = 0x5A827999;
-      } else if (i < 40) {
-        f = b ^ c ^ d;
-        k = 0x6ED9EBA1;
-      } else if (i < 60) {
-        f = (b & c) | (b & d) | (c & d);
-        k = 0x8F1BBCDC;
-      } else {
-        f = b ^ c ^ d;
-        k = 0xCA62C1D6;
-      }
-      uint32_t temp = rol(a, 5) + f + e + k + w[i];
-      e = d;
-      d = c;
-      c = rol(b, 30);
-      b = a;
-      a = temp;
-    }
-    h[0] += a;
-    h[1] += b;
-    h[2] += c;
-    h[3] += d;
-    h[4] += e;
-  }
-
-  void update(const void *data, size_t len) {
-    auto *p = static_cast<const uint8_t *>(data);
-    totalBits += len * 8;
-    while (len > 0) {
-      size_t toCopy = std::min(len, size_t(64) - bufLen);
-      std::memcpy(buf + bufLen, p, toCopy);
-      bufLen += toCopy;
-      p += toCopy;
-      len -= toCopy;
-      if (bufLen == 64) {
-        processBlock(buf);
-        bufLen = 0;
-      }
-    }
-  }
-
-  void digest(uint8_t out[20]) {
-    buf[bufLen++] = 0x80;
-    if (bufLen > 56) {
-      while (bufLen < 64) buf[bufLen++] = 0;
-      processBlock(buf);
-      bufLen = 0;
-    }
-    while (bufLen < 56) buf[bufLen++] = 0;
-    for (int i = 7; i >= 0; i--) {
-      buf[56 + (7 - i)] = uint8_t(totalBits >> (i * 8));
-    }
-    processBlock(buf);
-    for (int i = 0; i < 5; i++) {
-      out[i * 4 + 0] = uint8_t(h[i] >> 24);
-      out[i * 4 + 1] = uint8_t(h[i] >> 16);
-      out[i * 4 + 2] = uint8_t(h[i] >> 8);
-      out[i * 4 + 3] = uint8_t(h[i]);
-    }
-  }
-};
-
-// ─── Base64 encode ────────────────────────────────────────────────────
-
-std::string base64Encode(const uint8_t *data, size_t len) {
-  static const char table[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string out;
-  out.reserve(((len + 2) / 3) * 4);
-  for (size_t i = 0; i < len; i += 3) {
-    uint32_t n = uint32_t(data[i]) << 16;
-    if (i + 1 < len) n |= uint32_t(data[i + 1]) << 8;
-    if (i + 2 < len) n |= uint32_t(data[i + 2]);
-    out += table[(n >> 18) & 0x3F];
-    out += table[(n >> 12) & 0x3F];
-    out += (i + 1 < len) ? table[(n >> 6) & 0x3F] : '=';
-    out += (i + 2 < len) ? table[n & 0x3F] : '=';
-  }
-  return out;
-}
 
 // ─── UUID v4 ─────────────────────────────────────────────────────────
 
@@ -184,144 +60,6 @@ std::string generateUUID() {
     }
   }
   return uuid;
-}
-
-// ─── WebSocket framing ───────────────────────────────────────────────
-
-// Read exactly n bytes from fd. Returns false on error/close.
-bool readExact(int fd, void *buf, size_t n) {
-  auto *p = static_cast<uint8_t *>(buf);
-  while (n > 0) {
-    ssize_t r = ::read(fd, p, n);
-    if (r <= 0) return false;
-    p += r;
-    n -= static_cast<size_t>(r);
-  }
-  return true;
-}
-
-// Send all bytes. Returns false on error.
-bool sendAll(int fd, const void *buf, size_t n) {
-  auto *p = static_cast<const uint8_t *>(buf);
-  while (n > 0) {
-    ssize_t w = ::write(fd, p, n);
-    if (w <= 0) return false;
-    p += w;
-    n -= static_cast<size_t>(w);
-  }
-  return true;
-}
-
-// Read one WebSocket frame. opcode: 1=text, 2=binary, 8=close, 9=ping, 10=pong
-struct WSFrame {
-  uint8_t opcode;
-  bool fin;
-  std::vector<uint8_t> payload;
-};
-
-bool wsReadFrame(int fd, WSFrame &frame) {
-  uint8_t hdr[2];
-  if (!readExact(fd, hdr, 2)) return false;
-  frame.fin = (hdr[0] & 0x80) != 0;
-  frame.opcode = hdr[0] & 0x0F;
-  bool masked = (hdr[1] & 0x80) != 0;
-  uint64_t payloadLen = hdr[1] & 0x7F;
-  if (payloadLen == 126) {
-    uint8_t ext[2];
-    if (!readExact(fd, ext, 2)) return false;
-    payloadLen = (uint64_t(ext[0]) << 8) | ext[1];
-  } else if (payloadLen == 127) {
-    uint8_t ext[8];
-    if (!readExact(fd, ext, 8)) return false;
-    payloadLen = 0;
-    for (int i = 0; i < 8; i++) payloadLen = (payloadLen << 8) | ext[i];
-  }
-  uint8_t mask[4] = {};
-  if (masked) {
-    if (!readExact(fd, mask, 4)) return false;
-  }
-  frame.payload.resize(static_cast<size_t>(payloadLen));
-  if (payloadLen > 0) {
-    if (!readExact(fd, frame.payload.data(), frame.payload.size()))
-      return false;
-    if (masked) {
-      for (size_t i = 0; i < frame.payload.size(); i++) {
-        frame.payload[i] ^= mask[i % 4];
-      }
-    }
-  }
-  return true;
-}
-
-bool wsSendFrame(int fd, uint8_t opcode, const void *data, size_t len) {
-  uint8_t hdr[10];
-  size_t hdrLen = 0;
-  hdr[0] = 0x80 | opcode;  // FIN + opcode
-  if (len < 126) {
-    hdr[1] = uint8_t(len);
-    hdrLen = 2;
-  } else if (len < 65536) {
-    hdr[1] = 126;
-    hdr[2] = uint8_t(len >> 8);
-    hdr[3] = uint8_t(len);
-    hdrLen = 4;
-  } else {
-    hdr[1] = 127;
-    for (int i = 0; i < 8; i++) {
-      hdr[2 + i] = uint8_t(len >> ((7 - i) * 8));
-    }
-    hdrLen = 10;
-  }
-  if (!sendAll(fd, hdr, hdrLen)) return false;
-  if (len > 0 && !sendAll(fd, data, len)) return false;
-  return true;
-}
-
-bool wsSendText(int fd, const std::string &text) {
-  return wsSendFrame(fd, 1, text.data(), text.size());
-}
-
-bool wsSendClose(int fd) { return wsSendFrame(fd, 8, nullptr, 0); }
-
-// ─── WebSocket HTTP upgrade handshake ─────────────────────────────────
-
-bool wsHandshake(int fd) {
-  // Read HTTP request (up to 4KB)
-  char reqBuf[4096];
-  size_t reqLen = 0;
-  while (reqLen < sizeof(reqBuf) - 1) {
-    ssize_t r = ::read(fd, reqBuf + reqLen, sizeof(reqBuf) - 1 - reqLen);
-    if (r <= 0) return false;
-    reqLen += static_cast<size_t>(r);
-    reqBuf[reqLen] = '\0';
-    if (std::strstr(reqBuf, "\r\n\r\n")) break;
-  }
-
-  // Find Sec-WebSocket-Key
-  const char *keyHeader = "Sec-WebSocket-Key:";
-  const char *keyStart = strcasestr(reqBuf, keyHeader);
-  if (!keyStart) return false;
-  keyStart += std::strlen(keyHeader);
-  while (*keyStart == ' ') keyStart++;
-  const char *keyEnd = std::strstr(keyStart, "\r\n");
-  if (!keyEnd) return false;
-  std::string clientKey(keyStart, keyEnd);
-
-  // Compute accept key: SHA1(clientKey + magic) → base64
-  std::string concat = clientKey + "258EAFA5-E914-47DA-95CA-5AB5DC175B07";
-  SHA1 sha;
-  sha.update(concat.data(), concat.size());
-  uint8_t digest[20];
-  sha.digest(digest);
-  std::string acceptKey = base64Encode(digest, 20);
-
-  // Send HTTP 101
-  std::string response = "HTTP/1.1 101 Switching Protocols\r\n"
-                         "Upgrade: websocket\r\n"
-                         "Connection: Upgrade\r\n"
-                         "Sec-WebSocket-Accept: " +
-                         acceptKey + "\r\n\r\n";
-  return sendAll(fd, response.data(), response.size());
 }
 
 // ─── JSON helpers (minimal, no external library) ──────────────────────
@@ -353,7 +91,6 @@ std::string jsonEscape(const std::string &s) {
   return out;
 }
 
-// Simple JSON string value extractor: returns value for "key":"value"
 std::string jsonGetString(const std::string &json, const std::string &key) {
   std::string search = "\"" + key + "\"";
   auto pos = json.find(search);
@@ -380,59 +117,26 @@ std::vector<float> pcm16ToFloat(const uint8_t *data, size_t bytes) {
   return out;
 }
 
-}  // namespace
-
 // ─── Per-client session ─────────────────────────────────────────────
 
-static void handleClient(int clientFd, moonshine::Transcriber &transcriber,
-                          int32_t sampleRate, double updateInterval) {
-  // Enable TCP_NODELAY for low-latency responses
-  int flag = 1;
-  setsockopt(clientFd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
-  // WebSocket handshake
-  if (!wsHandshake(clientFd)) {
-    std::cerr << "WebSocket handshake failed" << std::endl;
-    close(clientFd);
-    return;
-  }
-
-  std::string sessionId = generateUUID();
-  auto sessionStart = std::chrono::steady_clock::now();
-  uint64_t totalSamples = 0;
+struct Session {
+  std::string id;
+  std::chrono::steady_clock::time_point startTime;
+  std::unique_ptr<moonshine::Stream> stream;
   std::atomic<int> turnOrder{0};
+  uint64_t totalSamples{0};
+  int32_t sampleRate{16000};
 
-  // Mutex to protect writing to the socket from multiple threads
-  std::mutex writeMutex;
-
-  std::cout << "[" << sessionId.substr(0, 8) << "] Client connected"
-            << std::endl;
-
-  // Send Begin message
-  {
-    auto now = std::chrono::system_clock::now();
-    auto expiresAt =
-        std::chrono::duration_cast<std::chrono::seconds>(
-            (now + std::chrono::hours(24)).time_since_epoch())
-            .count();
-    std::string beginMsg =
-        "{\"type\":\"Begin\",\"id\":\"" + sessionId +
-        "\",\"expires_at\":" + std::to_string(expiresAt) + "}";
-    wsSendText(clientFd, beginMsg);
-  }
-
-  // Create a stream for this session
-  moonshine::Stream stream = transcriber.createStream(updateInterval);
-
-  // Listener that sends Turn messages to the client
-  class SessionListener : public moonshine::TranscriptEventListener {
-   public:
-    int clientFd;
-    std::atomic<int> *turnOrder;
-    std::mutex *writeMutex;
+  // Listener for stream transcript events → sends Turn messages via WebSocket
+  struct Listener : public moonshine::TranscriptEventListener {
+    ix::WebSocket *ws{nullptr};
+    std::atomic<int> *turnOrderPtr{nullptr};
 
     void onLineTextChanged(const moonshine::LineTextChanged &event) override {
-      int order = ++(*turnOrder);
+      if (!ws) return;
+      int order = ++(*turnOrderPtr);
+      std::cout << "  [EVENT] LineTextChanged: \"" << event.line.text << "\""
+                << std::endl;
       std::string msg =
           "{\"type\":\"Turn\""
           ",\"turn_order\":" +
@@ -444,12 +148,15 @@ static void handleClient(int clientFd, moonshine::Transcriber &transcriber,
           jsonEscape(event.line.text) +
           "\""
           ",\"words\":[]}";
-      std::lock_guard<std::mutex> lock(*writeMutex);
-      wsSendText(clientFd, msg);
+      std::cout << "  [SEND] " << msg << std::endl;
+      ws->send(msg);
     }
 
     void onLineCompleted(const moonshine::LineCompleted &event) override {
-      int order = ++(*turnOrder);
+      if (!ws) return;
+      int order = ++(*turnOrderPtr);
+      std::cout << "  [EVENT] LineCompleted: \"" << event.line.text << "\""
+                << std::endl;
       std::string msg =
           "{\"type\":\"Turn\""
           ",\"turn_order\":" +
@@ -461,90 +168,22 @@ static void handleClient(int clientFd, moonshine::Transcriber &transcriber,
           jsonEscape(event.line.text) +
           "\""
           ",\"words\":[]}";
-      std::lock_guard<std::mutex> lock(*writeMutex);
-      wsSendText(clientFd, msg);
+      std::cout << "  [SEND] " << msg << std::endl;
+      ws->send(msg);
     }
   };
 
-  SessionListener listener;
-  listener.clientFd = clientFd;
-  listener.turnOrder = &turnOrder;
-  listener.writeMutex = &writeMutex;
-  stream.addListener(&listener);
-  stream.start();
+  Listener listener;
+};
 
-  // Read frames
-  WSFrame frame;
-  bool running = true;
-  while (running && wsReadFrame(clientFd, frame)) {
-    switch (frame.opcode) {
-      case 2: {  // Binary — PCM16 audio
-        if (frame.payload.empty()) break;
-        auto floats = pcm16ToFloat(frame.payload.data(), frame.payload.size());
-        totalSamples += floats.size();
-        stream.addAudio(floats, sampleRate);
-        break;
-      }
-      case 1: {  // Text — JSON control message
-        std::string text(frame.payload.begin(), frame.payload.end());
-        std::string msgType = jsonGetString(text, "type");
-        if (msgType == "ForceEndpoint") {
-          stream.updateTranscription(moonshine::Stream::FLAG_FORCE_UPDATE);
-        } else if (msgType == "Terminate") {
-          running = false;
-        }
-        break;
-      }
-      case 8: {  // Close
-        running = false;
-        break;
-      }
-      case 9: {  // Ping → Pong
-        std::lock_guard<std::mutex> lock(writeMutex);
-        wsSendFrame(clientFd, 10, frame.payload.data(), frame.payload.size());
-        break;
-      }
-      default:
-        break;
-    }
-  }
-
-  // Stop stream and flush final events
-  try {
-    stream.stop();
-  } catch (const std::exception &e) {
-    std::cerr << "[" << sessionId.substr(0, 8)
-              << "] Stream stop error: " << e.what() << std::endl;
-  }
-
-  // Send Termination
-  auto sessionEnd = std::chrono::steady_clock::now();
-  double audioDuration =
-      static_cast<double>(totalSamples) / static_cast<double>(sampleRate);
-  double sessionDuration =
-      std::chrono::duration<double>(sessionEnd - sessionStart).count();
-
-  {
-    std::ostringstream oss;
-    oss << "{\"type\":\"Termination\""
-        << ",\"audio_duration_seconds\":" << audioDuration
-        << ",\"session_duration_seconds\":" << sessionDuration << "}";
-    std::lock_guard<std::mutex> lock(writeMutex);
-    wsSendText(clientFd, oss.str());
-    wsSendClose(clientFd);
-  }
-
-  stream.close();
-  close(clientFd);
-
-  std::cout << "[" << sessionId.substr(0, 8) << "] Disconnected — audio="
-            << audioDuration << "s, session=" << sessionDuration << "s"
-            << std::endl;
-}
+}  // namespace
 
 // ─── Main ──────────────────────────────────────────────────────────
 
 int main(int argc, char *argv[]) {
+  std::setbuf(stdout, nullptr);
+  std::setbuf(stderr, nullptr);
+
   std::string modelPath;
   int modelArchInt = -1;
   int port = 8765;
@@ -602,33 +241,183 @@ int main(int argc, char *argv[]) {
   moonshine::Transcriber transcriber(modelPath, modelArch, updateInterval);
   std::cout << "Model loaded successfully" << std::endl;
 
-  // Create listening socket
-  int serverFd = socket(AF_INET, SOCK_STREAM, 0);
-  if (serverFd < 0) {
-    std::perror("socket");
+  // Initialize IXWebSocket networking (no-op on Unix, needed on Windows)
+  ix::initNetSystem();
+
+  // Session registry — keyed by IXWebSocket connection ID
+  std::unordered_map<std::string, std::shared_ptr<Session>> sessions;
+  std::mutex sessionsMutex;
+
+  ix::WebSocketServer server(port, "0.0.0.0");
+  server.disablePerMessageDeflate();
+
+  server.setOnClientMessageCallback(
+      [&transcriber, &sessions, &sessionsMutex, sampleRate, updateInterval](
+          std::shared_ptr<ix::ConnectionState> connectionState,
+          ix::WebSocket &ws, const ix::WebSocketMessagePtr &msg) {
+        std::string connId = connectionState->getId();
+
+        switch (msg->type) {
+          case ix::WebSocketMessageType::Open: {
+            auto session = std::make_shared<Session>();
+            session->id = generateUUID();
+            session->startTime = std::chrono::steady_clock::now();
+            session->sampleRate = sampleRate;
+            session->stream = std::make_unique<moonshine::Stream>(
+                transcriber.createStream(updateInterval));
+
+            // Wire up the listener
+            session->listener.ws = &ws;
+            session->listener.turnOrderPtr = &session->turnOrder;
+            session->stream->addListener(&session->listener);
+            session->stream->start();
+
+            {
+              std::lock_guard<std::mutex> lock(sessionsMutex);
+              sessions[connId] = session;
+            }
+
+            // Send Begin message
+            auto now = std::chrono::system_clock::now();
+            auto expiresAt =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    (now + std::chrono::hours(24)).time_since_epoch())
+                    .count();
+            std::string beginMsg =
+                "{\"type\":\"Begin\",\"id\":\"" + session->id +
+                "\",\"expires_at\":" + std::to_string(expiresAt) + "}";
+
+            std::cout << "[" << session->id.substr(0, 8) << "] Client connected"
+                      << std::endl;
+            std::cout << "  [SEND] " << beginMsg << std::endl;
+            ws.send(beginMsg);
+            break;
+          }
+
+          case ix::WebSocketMessageType::Message: {
+            std::shared_ptr<Session> session;
+            {
+              std::lock_guard<std::mutex> lock(sessionsMutex);
+              auto it = sessions.find(connId);
+              if (it != sessions.end()) session = it->second;
+            }
+            if (!session) break;
+
+            if (msg->binary) {
+              // Binary — PCM16 audio
+              const auto *data =
+                  reinterpret_cast<const uint8_t *>(msg->str.data());
+              size_t bytes = msg->str.size();
+              if (bytes == 0) break;
+              auto floats = pcm16ToFloat(data, bytes);
+              session->totalSamples += floats.size();
+              std::cout << "  [AUDIO] " << floats.size() << " samples ("
+                        << (double(floats.size()) / sampleRate * 1000.0)
+                        << "ms), total="
+                        << (double(session->totalSamples) / sampleRate) << "s"
+                        << std::endl;
+              session->stream->addAudio(floats, sampleRate);
+            } else {
+              // Text — JSON control message
+              std::string msgType = jsonGetString(msg->str, "type");
+              std::cout << "  [CTRL] " << msg->str << std::endl;
+
+              if (msgType == "ForceEndpoint") {
+                std::cout << "  [CTRL] Forcing transcription update"
+                          << std::endl;
+                session->stream->updateTranscription(
+                    moonshine::Stream::FLAG_FORCE_UPDATE);
+              } else if (msgType == "Terminate") {
+                std::cout << "  [CTRL] Terminate requested" << std::endl;
+
+                // Stop stream and flush final events
+                try {
+                  session->stream->stop();
+                } catch (const std::exception &e) {
+                  std::cout << "Stream stop error: " << e.what() << std::endl;
+                }
+
+                // Send Termination
+                auto sessionEnd = std::chrono::steady_clock::now();
+                double audioDur =
+                    double(session->totalSamples) / double(sampleRate);
+                double sessDur =
+                    std::chrono::duration<double>(sessionEnd -
+                                                  session->startTime)
+                        .count();
+                std::ostringstream oss;
+                oss << "{\"type\":\"Termination\""
+                    << ",\"audio_duration_seconds\":" << audioDur
+                    << ",\"session_duration_seconds\":" << sessDur << "}";
+                std::cout << "  [SEND] " << oss.str() << std::endl;
+                ws.send(oss.str());
+
+                session->stream->close();
+                session->listener.ws = nullptr;
+                {
+                  std::lock_guard<std::mutex> lock(sessionsMutex);
+                  sessions.erase(connId);
+                }
+                ws.close();
+              }
+            }
+            break;
+          }
+
+          case ix::WebSocketMessageType::Close: {
+            std::shared_ptr<Session> session;
+            {
+              std::lock_guard<std::mutex> lock(sessionsMutex);
+              auto it = sessions.find(connId);
+              if (it != sessions.end()) {
+                session = it->second;
+                sessions.erase(it);
+              }
+            }
+            if (!session) break;
+
+            session->listener.ws = nullptr;
+            try {
+              session->stream->stop();
+            } catch (const std::exception &e) {
+              std::cout << "Stream stop error: " << e.what() << std::endl;
+            }
+
+            auto sessionEnd = std::chrono::steady_clock::now();
+            double audioDur =
+                double(session->totalSamples) / double(sampleRate);
+            double sessDur =
+                std::chrono::duration<double>(sessionEnd - session->startTime)
+                    .count();
+            session->stream->close();
+
+            std::cout << "[" << session->id.substr(0, 8)
+                      << "] Disconnected — audio=" << audioDur
+                      << "s, session=" << sessDur << "s" << std::endl;
+            break;
+          }
+
+          case ix::WebSocketMessageType::Error: {
+            std::cout << "[" << connId.substr(0, 8)
+                      << "] WebSocket error: " << msg->errorInfo.reason
+                      << std::endl;
+            break;
+          }
+
+          default:
+            break;
+        }
+      });
+
+  auto res = server.listen();
+  if (!res.first) {
+    std::cerr << "Failed to listen on port " << port << ": " << res.second
+              << std::endl;
+    ix::uninitNetSystem();
     return 1;
   }
 
-  int opt = 1;
-  setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-  struct sockaddr_in addr {};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(static_cast<uint16_t>(port));
-
-  if (bind(serverFd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) <
-      0) {
-    std::perror("bind");
-    close(serverFd);
-    return 1;
-  }
-
-  if (listen(serverFd, 8) < 0) {
-    std::perror("listen");
-    close(serverFd);
-    return 1;
-  }
+  server.start();
 
   std::cout << "Moonshine STT server listening on ws://0.0.0.0:" << port
             << std::endl;
@@ -637,23 +426,9 @@ int main(int argc, char *argv[]) {
   std::cout << "  Protocol: AssemblyAI Streaming v3 compatible" << std::endl;
   std::cout << std::endl;
 
-  // Accept loop — one thread per client
-  while (true) {
-    struct sockaddr_in clientAddr {};
-    socklen_t clientLen = sizeof(clientAddr);
-    int clientFd = accept(serverFd,
-                          reinterpret_cast<struct sockaddr *>(&clientAddr),
-                          &clientLen);
-    if (clientFd < 0) {
-      std::perror("accept");
-      continue;
-    }
-    // Detach a thread for each client
-    std::thread(handleClient, clientFd, std::ref(transcriber), sampleRate,
-                updateInterval)
-        .detach();
-  }
+  // Block until interrupted
+  server.wait();
 
-  close(serverFd);
+  ix::uninitNetSystem();
   return 0;
 }

@@ -212,6 +212,22 @@ target_link_libraries(benchmark PRIVATE
 )
 
 if (NOT WIN32 AND NOT IOS AND NOT ANDROID)
+    # Fetch IXWebSocket — proper WebSocket library for moonshine-server
+    include(FetchContent)
+    FetchContent_Declare(
+        ixwebsocket
+        GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
+        GIT_TAG v11.4.5
+    )
+    set(USE_TLS OFF CACHE BOOL "" FORCE)
+    set(USE_ZLIB OFF CACHE BOOL "" FORCE)
+    set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(ixwebsocket)
+    # Suppress warnings-as-errors for third-party code
+    if (TARGET ixwebsocket)
+        target_compile_options(ixwebsocket PRIVATE -Wno-error -Wno-all -Wno-extra)
+    endif()
+
     add_executable(moonshine-server moonshine-server.cpp)
     set_target_properties(moonshine-server PROPERTIES
         CXX_STANDARD 20
@@ -223,6 +239,7 @@ if (NOT WIN32 AND NOT IOS AND NOT ANDROID)
     )
     target_link_libraries(moonshine-server PRIVATE
         moonshine
+        ixwebsocket::ixwebsocket
     )
 endif()
 
