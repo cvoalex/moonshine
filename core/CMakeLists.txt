@@ -211,6 +211,21 @@ target_link_libraries(benchmark PRIVATE
     moonshine
 )
 
+if (NOT WIN32 AND NOT IOS AND NOT ANDROID)
+    add_executable(moonshine-server moonshine-server.cpp)
+    set_target_properties(moonshine-server PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+    )
+    target_include_directories(moonshine-server PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}
+    )
+    target_link_libraries(moonshine-server PRIVATE
+        moonshine
+    )
+endif()
+
 # Windows DLLs don't export all symbols by default and so tests that rely on them
 # are skipped for shared builds.
 if (NOT WIN32 OR NOT MOONSHINE_BUILD_SHARED)

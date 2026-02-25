@@ -345,125 +345,114 @@ Key design points from the source:
 - **Audio buffering is lock-free-ish** — `addAudio()` just appends to a buffer (fast, safe to call from audio capture threads)
 - **VAD runs per-stream** with its own mutex, so voice detection is parallelized
 
-### C++ Streaming Service Example
+### C++ WebSocket STT Server (`moonshine-server`)
 
-Here's a complete example of a WebSocket-based streaming transcription server. This accepts audio chunks over WebSocket connections and returns transcript updates in real time.
+The project includes a standalone C++ WebSocket server that speaks the **AssemblyAI Streaming v3 protocol**. It's a single binary with zero external dependencies (raw POSIX sockets, built-in SHA-1 + base64 for the WebSocket handshake).
 
-```cpp
-// streaming-server.cpp
-// Requires: libmoonshine, libwebsocketpp (or your WS library of choice)
-// Simplified example — add error handling for production use.
+#### Build
 
-#include <iostream>
-#include <thread>
-#include <mutex>
-#include <map>
-#include <atomic>
+The server is built automatically with the rest of the project:
 
-#include "moonshine-cpp.h"
+```bash
+cd core/build
+cmake ..
+cmake --build . --target moonshine-server -j$(nproc)
+```
 
-// A per-client session managing its own Stream
-struct ClientSession {
-  moonshine::Stream stream;
-  std::mutex audioMutex;
+#### Run
 
-  ClientSession(moonshine::Transcriber& transcriber)
-      : stream(transcriber.createStream(0.5)) {}
+```bash
+./moonshine-server \
+  --model-path /path/to/model \
+  --model-arch 2 \
+  --port 8765
+```
+
+**Options:**
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-m, --model-path` | *(required)* | Path to model directory |
+| `-a, --model-arch` | *(required)* | `0`=tiny, `1`=base, `2`=tiny-streaming, `3`=base-streaming, `4`=small-streaming, `5`=medium-streaming |
+| `-p, --port` | `8765` | WebSocket listen port |
+| `--sample-rate` | `16000` | Expected input sample rate (Hz) |
+| `--update-interval` | `0.5` | Seconds between transcription updates |
+
+#### Protocol (AssemblyAI v3 Compatible)
+
+Clients connect via WebSocket and exchange these messages:
+
+**Client → Server:**
+- **Binary frames** — Raw PCM16-LE audio bytes (16-bit signed, little-endian, mono)
+- `{"type":"ForceEndpoint"}` — Force end-of-turn (like VAD stop)
+- `{"type":"Terminate"}` — End the session gracefully
+
+**Server → Client:**
+- `{"type":"Begin","id":"<session-uuid>","expires_at":<unix-ts>}` — On connect
+- `{"type":"Turn","turn_order":N,"transcript":"...","end_of_turn":false,...}` — Interim result
+- `{"type":"Turn","turn_order":N,"transcript":"...","end_of_turn":true,...}` — Final result
+- `{"type":"Termination","audio_duration_seconds":...,"session_duration_seconds":...}` — On disconnect
+
+#### Use with AssemblyAI Clients
+
+Any client built for AssemblyAI's real-time API can be pointed at `moonshine-server` — just change the endpoint URL:
+
+```python
+# Python (pipecat AssemblyAI service)
+stt = AssemblyAISTTService(
+    api_key="unused",                            # no auth needed
+    api_endpoint_base_url="ws://localhost:8765",  # ← moonshine-server
+)
+```
+
+```javascript
+// JavaScript
+const ws = new WebSocket("ws://your-server:8765");
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === "Turn") {
+    console.log(msg.end_of_turn ? "FINAL:" : "PARTIAL:", msg.transcript);
+  }
 };
+// Send PCM16 audio chunks as binary
+ws.send(audioChunk);  // ArrayBuffer of PCM16-LE bytes
+```
 
-class TranscriptionService {
-public:
-  TranscriptionService(const std::string& modelPath,
-                       moonshine::ModelArch modelArch)
-      : transcriber_(modelPath, modelArch) {}
+#### How It Works Internally
 
-  // Called when a new client connects
-  int32_t onClientConnected() {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    int32_t clientId = nextClientId_++;
+- The model loads **once** at startup and is shared across all clients
+- Each WebSocket client gets its own `moonshine::Stream` (transcription session)
+- Audio processing runs one thread per client
+- Moonshine events (`LineTextChanged`, `LineCompleted`) are converted to AssemblyAI `Turn` messages on the fly
+- Model inference is serialized internally via mutex — multiple clients queue up safely
 
-    auto session = std::make_unique<ClientSession>(transcriber_);
+#### systemd Service
 
-    // Set up event listener for this client
-    session->stream.addListener(
-        [clientId](const moonshine::TranscriptEvent& event) {
-          if (event.type == moonshine::TranscriptEvent::LINE_TEXT_CHANGED) {
-            // Send partial transcript back to client via WebSocket
-            std::cout << "[Client " << clientId << " partial] "
-                      << event.line.text << std::endl;
-          }
-          if (event.type == moonshine::TranscriptEvent::LINE_COMPLETED) {
-            // Send final line to client
-            std::cout << "[Client " << clientId << " final] "
-                      << event.line.text << std::endl;
-          }
-        });
+```ini
+[Unit]
+Description=Moonshine STT WebSocket Server
+After=network.target
 
-    session->stream.start();
-    sessions_[clientId] = std::move(session);
-    return clientId;
-  }
+[Service]
+Type=simple
+ExecStart=/opt/moonshine/core/build/moonshine-server \
+  --model-path /opt/moonshine/models/tiny-streaming-en \
+  --model-arch 2 \
+  --port 8765
+Restart=always
+RestartSec=3
+User=moonshine
+WorkingDirectory=/opt/moonshine
 
-  // Called when audio chunk arrives from a client
-  void onAudioReceived(int32_t clientId,
-                       const std::vector<float>& audioChunk,
-                       int32_t sampleRate) {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = sessions_.find(clientId);
-    if (it == sessions_.end()) return;
+[Install]
+WantedBy=multi-user.target
+```
 
-    // addAudio is fast — it just buffers. The transcription
-    // happens automatically when enough audio accumulates.
-    it->second->stream.addAudio(audioChunk, sampleRate);
-  }
-
-  // Called when client disconnects
-  void onClientDisconnected(int32_t clientId) {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = sessions_.find(clientId);
-    if (it == sessions_.end()) return;
-
-    it->second->stream.stop();
-    it->second->stream.close();
-    sessions_.erase(it);
-  }
-
-  size_t activeConnections() {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    return sessions_.size();
-  }
-
-private:
-  moonshine::Transcriber transcriber_;
-  std::map<int32_t, std::unique_ptr<ClientSession>> sessions_;
-  std::mutex sessionsMutex_;
-  std::atomic<int32_t> nextClientId_{0};
-};
-
-int main(int argc, char* argv[]) {
-  std::string modelPath = "tiny-en";
-  moonshine::ModelArch modelArch = moonshine::ModelArch::TINY;
-
-  TranscriptionService service(modelPath, modelArch);
-
-  // Simulate 3 concurrent clients
-  auto c1 = service.onClientConnected();
-  auto c2 = service.onClientConnected();
-  auto c3 = service.onClientConnected();
-
-  std::cout << "Active connections: "
-            << service.activeConnections() << std::endl;
-
-  // In production, you'd wire this up to a WebSocket server
-  // (e.g., Boost.Beast, uWebSockets, libwebsocketpp)
-  // and call onAudioReceived() in the WS message handler.
-
-  service.onClientDisconnected(c1);
-  service.onClientDisconnected(c2);
-  service.onClientDisconnected(c3);
-
-  return 0;
-}
+```bash
+sudo cp moonshine-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now moonshine-server
+sudo systemctl status moonshine-server
 ```
 
 ### Multiple Transcriber Instances (True Parallelism)
